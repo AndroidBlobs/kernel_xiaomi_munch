@@ -270,8 +270,6 @@ static void msm_geni_serial_set_manual_flow(bool enable,
 static bool handle_rx_dma_xfer(u32 s_irq_status, struct uart_port *uport);
 static int uart_line_id;
 
-static bool is_earlycon;
-
 #define GET_DEV_PORT(uport) \
 	container_of(uport, struct msm_geni_serial_port, uport)
 
@@ -321,14 +319,7 @@ static int msm_geni_serial_spinlocked(struct uart_port *uport)
 static void msm_geni_serial_enable_interrupts(struct uart_port *uport)
 {
 	unsigned int geni_m_irq_en, geni_s_irq_en;
-	struct msm_geni_serial_port *port = NULL;
-
-	/*
-	 * Earlyconsole also uses this API and finds port is NULL,
-	 * hence add a protective check.
-	 */
-	if (!is_earlycon)
-		port = GET_DEV_PORT(uport);
+	struct msm_geni_serial_port *port = GET_DEV_PORT(uport);
 
 	geni_m_irq_en = geni_read_reg_nolog(uport->membase,
 						SE_GENI_M_IRQ_EN);
@@ -340,7 +331,7 @@ static void msm_geni_serial_enable_interrupts(struct uart_port *uport)
 
 	geni_write_reg_nolog(geni_m_irq_en, uport->membase, SE_GENI_M_IRQ_EN);
 	geni_write_reg_nolog(geni_s_irq_en, uport->membase, SE_GENI_S_IRQ_EN);
-	if (port && port->xfer_mode == SE_DMA) {
+	if (port->xfer_mode == SE_DMA) {
 		geni_write_reg_nolog(DMA_TX_IRQ_BITS, uport->membase,
 							SE_DMA_TX_IRQ_EN_SET);
 		geni_write_reg_nolog(DMA_RX_IRQ_BITS, uport->membase,
@@ -2326,6 +2317,9 @@ static void msm_geni_serial_shutdown(struct uart_port *uport)
 		msm_geni_serial_stop_tx(uport);
 	}
 
+	if (likely(!uart_console(uport)))
+		disable_irq(uport->irq);
+
 	if (!uart_console(uport)) {
 		if (msm_port->ioctl_count) {
 			int i;
@@ -2473,6 +2467,8 @@ static int msm_geni_serial_startup(struct uart_port *uport)
 		}
 	}
 
+	if (likely(!uart_console(uport)))
+		enable_irq(uport->irq);
 	/*
 	 * Ensure that all the port configuration writes complete
 	 * before returning to the framework.
@@ -2967,7 +2963,6 @@ msm_geni_serial_earlycon_setup(struct earlycon_device *dev,
 	unsigned long clk_rate;
 	unsigned long cfg0, cfg1;
 
-	is_earlycon = true;
 	if (!uport->membase) {
 		ret = -ENOMEM;
 		goto exit_geni_serial_earlyconsetup;
@@ -3065,10 +3060,23 @@ OF_EARLYCON_DECLARE(msm_geni_serial, "qcom,msm-geni-console",
 
 static int console_register(struct uart_driver *drv)
 {
+#ifdef CONFIG_FASTBOOT_CMD_CTRL_UART
+	if (!is_early_cons_enabled) {
+		pr_info("ignore console register\n");
+		return 0;
+	}
+#endif
+
 	return uart_register_driver(drv);
 }
 static void console_unregister(struct uart_driver *drv)
 {
+#ifdef CONFIG_FASTBOOT_CMD_CTRL_UART
+	if (!is_early_cons_enabled) {
+		pr_info("ignore console unregister\n");
+		return;
+	}
+#endif
 	uart_unregister_driver(drv);
 }
 
@@ -3309,6 +3317,16 @@ static int msm_geni_serial_probe(struct platform_device *pdev)
 		return -ENODEV;
 	}
 
+#ifdef CONFIG_FASTBOOT_CMD_CTRL_UART
+		/*if earlycon is not enabled, we should ignore console
+		  driver prob*/
+	if (!is_early_cons_enabled &&
+		(!strcmp(id->compatible, "qcom,msm-geni-console"))) {
+			pr_info("ignore cons prob\n");
+		return -ENODEV;
+	}
+#endif
+
 	if (pdev->dev.of_node) {
 		if (drv->cons) {
 			line = of_alias_get_id(pdev->dev.of_node, "serial");
@@ -3514,6 +3532,13 @@ static int msm_geni_serial_probe(struct platform_device *pdev)
 	irq_set_status_flags(uport->irq, IRQ_NOAUTOEN);
 	ret = devm_request_irq(uport->dev, uport->irq, msm_geni_serial_isr,
 				IRQF_TRIGGER_HIGH, dev_port->name, uport);
+	if(likely(!uart_console(uport))) {
+		/*
+		 * irq should disable untill msm_geni_serial_port_setup
+		 * called in msm_geni_serial_startup.
+		 */
+		disable_irq(uport->irq);
+	}
 	if (ret) {
 		dev_err(uport->dev, "%s: Failed to get IRQ ret %d\n",
 							__func__, ret);
@@ -3574,13 +3599,6 @@ static int msm_geni_serial_probe(struct platform_device *pdev)
 
 	if (!uart_console(uport))
 		spin_lock_init(&dev_port->rx_lock);
-
-	/*
-	 * Earlyconsole to kernel console will switch happen after
-	 * uart_add_one_port. Hence marking is_earlycon to false here.
-	 */
-	if (is_console)
-		is_earlycon = false;
 
 	IPC_LOG_MSG(dev_port->ipc_log_misc, "%s: port:%s irq:%d\n", __func__,
 		    uport->name, uport->irq);
