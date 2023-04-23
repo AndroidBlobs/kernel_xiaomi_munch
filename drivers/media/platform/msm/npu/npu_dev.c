@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2018-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2018-2020, The Linux Foundation. All rights reserved.
  */
 
 /* -------------------------------------------------------------------------
@@ -90,6 +90,8 @@ static int npu_unload_network(struct npu_client *client,
 	unsigned long arg);
 static int npu_exec_network_v2(struct npu_client *client,
 	unsigned long arg);
+static int npu_receive_event(struct npu_client *client,
+	unsigned long arg);
 static int npu_set_fw_state(struct npu_client *client, uint32_t enable);
 static int npu_set_property(struct npu_client *client,
 	unsigned long arg);
@@ -97,6 +99,7 @@ static int npu_get_property(struct npu_client *client,
 	unsigned long arg);
 static long npu_ioctl(struct file *file, unsigned int cmd,
 					unsigned long arg);
+static unsigned int npu_poll(struct file *filp, struct poll_table_struct *p);
 static int npu_parse_dt_clock(struct npu_device *npu_dev);
 static int npu_parse_dt_regulator(struct npu_device *npu_dev);
 static int npu_parse_dt_bw(struct npu_device *npu_dev);
@@ -105,8 +108,8 @@ static int npu_of_parse_pwrlevels(struct npu_device *npu_dev,
 static int npu_pwrctrl_init(struct npu_device *npu_dev);
 static int npu_probe(struct platform_device *pdev);
 static int npu_remove(struct platform_device *pdev);
-static int npu_pm_suspend(struct device *dev);
-static int npu_pm_resume(struct device *dev);
+static int npu_suspend(struct platform_device *dev, pm_message_t state);
+static int npu_resume(struct platform_device *dev);
 static int __init npu_init(void);
 static void __exit npu_exit(void);
 static uint32_t npu_notify_cdsprm_cxlimit_corner(struct npu_device *npu_dev,
@@ -185,17 +188,17 @@ static const struct of_device_id npu_dt_match[] = {
 	{}
 };
 
-static const struct dev_pm_ops npu_pm_ops = {
-	SET_SYSTEM_SLEEP_PM_OPS(npu_pm_suspend, npu_pm_resume)
-};
-
 static struct platform_driver npu_driver = {
 	.probe = npu_probe,
 	.remove = npu_remove,
+#if defined(CONFIG_PM)
+	.suspend = npu_suspend,
+	.resume = npu_resume,
+#endif
 	.driver = {
 		.name = "msm_npu",
 		.of_match_table = npu_dt_match,
-		.pm = &npu_pm_ops,
+		.pm = NULL,
 	},
 };
 
@@ -207,6 +210,7 @@ static const struct file_operations npu_fops = {
 #ifdef CONFIG_COMPAT
 	 .compat_ioctl = npu_ioctl,
 #endif
+	.poll = npu_poll,
 };
 
 static const struct thermal_cooling_device_ops npu_cooling_ops = {
@@ -1251,7 +1255,9 @@ static int npu_open(struct inode *inode, struct file *file)
 		return -ENOMEM;
 
 	client->npu_dev = npu_dev;
+	init_waitqueue_head(&client->wait);
 	mutex_init(&client->list_lock);
+	INIT_LIST_HEAD(&client->evt_list);
 	INIT_LIST_HEAD(&(client->mapped_buffer_list));
 	file->private_data = client;
 
@@ -1261,8 +1267,16 @@ static int npu_open(struct inode *inode, struct file *file)
 static int npu_close(struct inode *inode, struct file *file)
 {
 	struct npu_client *client = file->private_data;
+	struct npu_kevent *kevent;
 
 	npu_host_cleanup_networks(client);
+
+	while (!list_empty(&client->evt_list)) {
+		kevent = list_first_entry(&client->evt_list,
+			struct npu_kevent, list);
+		list_del(&kevent->list);
+		kfree(kevent);
+	}
 
 	mutex_destroy(&client->list_lock);
 	kfree(client);
@@ -1511,6 +1525,35 @@ static int npu_exec_network_v2(struct npu_client *client,
 	return ret;
 }
 
+static int npu_receive_event(struct npu_client *client,
+	unsigned long arg)
+{
+	void __user *argp = (void __user *)arg;
+	struct npu_kevent *kevt;
+	int ret = 0;
+
+	mutex_lock(&client->list_lock);
+	if (list_empty(&client->evt_list)) {
+		NPU_ERR("event list is empty\n");
+		ret = -EINVAL;
+	} else {
+		kevt = list_first_entry(&client->evt_list,
+			struct npu_kevent, list);
+		list_del(&kevt->list);
+		npu_process_kevent(client, kevt);
+		ret = copy_to_user(argp, &kevt->evt,
+			sizeof(struct msm_npu_event));
+		if (ret) {
+			NPU_ERR("fail to copy to user\n");
+			ret = -EFAULT;
+		}
+		kfree(kevt);
+	}
+	mutex_unlock(&client->list_lock);
+
+	return ret;
+}
+
 static int npu_set_fw_state(struct npu_client *client, uint32_t enable)
 {
 	struct npu_device *npu_dev = client->npu_dev;
@@ -1672,6 +1715,9 @@ static long npu_ioctl(struct file *file, unsigned int cmd,
 	case MSM_NPU_EXEC_NETWORK_V2:
 		ret = npu_exec_network_v2(client, arg);
 		break;
+	case MSM_NPU_RECEIVE_EVENT:
+		ret = npu_receive_event(client, arg);
+		break;
 	case MSM_NPU_SET_PROP:
 		ret = npu_set_property(client, arg);
 		break;
@@ -1683,6 +1729,23 @@ static long npu_ioctl(struct file *file, unsigned int cmd,
 	}
 
 	return ret;
+}
+
+static unsigned int npu_poll(struct file *filp, struct poll_table_struct *p)
+{
+	struct npu_client *client = filp->private_data;
+	int rc = 0;
+
+	poll_wait(filp, &client->wait, p);
+
+	mutex_lock(&client->list_lock);
+	if (!list_empty(&client->evt_list)) {
+		NPU_DBG("poll cmd done\n");
+		rc = POLLIN | POLLRDNORM;
+	}
+	mutex_unlock(&client->list_lock);
+
+	return rc;
 }
 
 /* -------------------------------------------------------------------------
@@ -2403,7 +2466,7 @@ static int npu_probe(struct platform_device *pdev)
 	npu_dev->pdev = pdev;
 	mutex_init(&npu_dev->dev_lock);
 
-	dev_set_drvdata(&pdev->dev, npu_dev);
+	platform_set_drvdata(pdev, npu_dev);
 	res = platform_get_resource_byname(pdev,
 		IORESOURCE_MEM, "core");
 	if (!res) {
@@ -2631,7 +2694,6 @@ error_class_create:
 	unregister_chrdev_region(npu_dev->dev_num, 1);
 	npu_mbox_deinit(npu_dev);
 error_get_dev_num:
-	dev_set_drvdata(&pdev->dev, NULL);
 	return rc;
 }
 
@@ -2650,7 +2712,7 @@ static int npu_remove(struct platform_device *pdev)
 	device_destroy(npu_dev->class, npu_dev->dev_num);
 	class_destroy(npu_dev->class);
 	unregister_chrdev_region(npu_dev->dev_num, 1);
-	dev_set_drvdata(&pdev->dev, NULL);
+	platform_set_drvdata(pdev, NULL);
 	npu_mbox_deinit(npu_dev);
 	msm_bus_scale_unregister_client(npu_dev->bwctrl.bus_client);
 
@@ -2663,28 +2725,17 @@ static int npu_remove(struct platform_device *pdev)
  * Suspend/Resume
  * -------------------------------------------------------------------------
  */
-static int npu_pm_suspend(struct device *dev)
+#if defined(CONFIG_PM)
+static int npu_suspend(struct platform_device *dev, pm_message_t state)
 {
-	struct npu_device *npu_dev;
-
-	npu_dev = dev_get_drvdata(dev);
-	if (!npu_dev) {
-		NPU_ERR("invalid NPU dev\n");
-		return -EINVAL;
-	}
-
-	NPU_DBG("suspend npu\n");
-	npu_host_suspend(npu_dev);
-
 	return 0;
 }
 
-static int npu_pm_resume(struct device *dev)
+static int npu_resume(struct platform_device *dev)
 {
-	NPU_DBG("resume npu\n");
 	return 0;
 }
-
+#endif
 /* -------------------------------------------------------------------------
  * Module Entry Points
  * -------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * Copyright (c) 2017-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2017-2020, The Linux Foundation. All rights reserved.
  */
 
 #ifndef _NPU_MGR_H
@@ -85,6 +85,7 @@ struct npu_network {
 	bool is_valid;
 	bool is_active;
 	bool fw_error;
+	bool is_async;
 	struct npu_client *client;
 	struct list_head cmd_list;
 };
@@ -130,12 +131,10 @@ struct npu_host_ctx {
 	uint32_t err_irq_sts;
 	uint32_t wdg_irq_sts;
 	bool fw_error;
-	bool dev_shuttingdown;
 	bool cancel_work;
 	bool app_crashed;
 	struct notifier_block nb;
 	struct notifier_block panic_nb;
-	struct notifier_block reboot_nb;
 	void *notif_hdle;
 	spinlock_t bridge_mbox_lock;
 	bool bridge_mbox_pwr_on;
@@ -192,7 +191,6 @@ int npu_host_update_power(struct npu_device *npu_dev);
 int32_t npu_host_set_perf_mode(struct npu_client *client, uint32_t network_hdl,
 	uint32_t perf_mode);
 int32_t npu_host_get_perf_mode(struct npu_client *client, uint32_t network_hdl);
-void npu_host_suspend(struct npu_device *npu_dev);
 void npu_dump_debug_info(struct npu_device *npu_dev);
 void npu_dump_ipc_packet(struct npu_device *npu_dev, void *cmd_ptr);
 
